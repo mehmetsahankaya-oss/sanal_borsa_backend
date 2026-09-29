@@ -5,6 +5,7 @@ import requests
 import uvicorn
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Header
@@ -19,15 +20,11 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 BASLANGIC_BAKIYESI = 100000.0
 
 # ÖNEMLİ: Bunu Render'da ortam değişkeni (Environment Variable) olarak
-# JWT_SECRET adıyla kendiniz belirleyin (rastgele uzun bir metin). Burada
-# yazan sadece yerel geliştirme için bir varsayılandır.
+# JWT_SECRET adıyla kendiniz belirleyin (rastgele uzun bir metin).
 JWT_SECRET = os.environ.get("JWT_SECRET", "sanal-borsa-gizli-anahtar-BUNU-DEGISTIR")
 JWT_ALGORITMA = "HS256"
 JWT_GECERLILIK_GUN = 30
 
-# Render'ın ücretsiz planında disk her zaman kalıcı olmayabilir. Üretimde
-# DATABASE_URL ortam değişkenini ücretsiz bir Postgres bağlantısına
-# (örn. Supabase) ayarlayın. Ayarlanmazsa yerel SQLite dosyası kullanılır.
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./sanal_borsa.db")
 
 engine_kwargs = {}
@@ -37,6 +34,8 @@ if DATABASE_URL.startswith("sqlite"):
 engine = create_engine(DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+TR_ZAMAN_DILIMI = ZoneInfo("Europe/Istanbul")
 
 # ==========================================
 # VERİTABANI MODELLERİ
@@ -145,6 +144,23 @@ def guncel_fiyat_getir(sembol: str) -> Optional[float]:
         return float(fiyat) if fiyat is not None else None
     except Exception:
         return None
+
+
+def piyasa_acik_mi():
+    """
+    BIST normal seans saatlerini kontrol eder: Hafta içi 10:00 - 18:00 (TR saati).
+    NOT: Resmi tatiller bu kontrolde YER ALMIYOR (örn. 23 Nisan, 1 Mayıs vb.) —
+    sadece hafta sonu + saat kontrolü yapılıyor. Tam bir tatil takvimi eklemek
+    istersen ileride burayı genişletebiliriz.
+    """
+    simdi = datetime.now(TR_ZAMAN_DILIMI)
+    if simdi.weekday() >= 5:  # 5=Cumartesi, 6=Pazar
+        return False, "Borsa hafta sonu kapalı. BIST işlem saatleri: hafta içi 10:00 - 18:00 (TR saati)."
+    acilis = simdi.replace(hour=10, minute=0, second=0, microsecond=0)
+    kapanis = simdi.replace(hour=18, minute=0, second=0, microsecond=0)
+    if simdi < acilis or simdi >= kapanis:
+        return False, "Şu anda mesai saatleri dışındayız. BIST işlem saatleri: hafta içi 10:00 - 18:00 (TR saati)."
+    return True, "Piyasa açık."
 
 
 def gecerli_kullanici(authorization: str = Header(None), db: Session = Depends(db_al)) -> Kullanici:
@@ -271,7 +287,114 @@ def giris_yap(istek: GirisIstek, db: Session = Depends(db_al)):
 
 
 # ==========================================
-# ROTALAR: FİYAT, PORTFÖY VE İŞLEMLER
+# ROTALAR: PİYASA VERİLERİ (herkese açık, giriş gerektirmez)
+# ==========================================
+@app.get("/piyasa-durumu")
+def piyasa_durumu_getir():
+    acik, mesaj = piyasa_acik_mi()
+    return {"acik": acik, "mesaj": mesaj}
+
+
+@app.get("/piyasa")
+def piyasa_verilerini_getir():
+    try:
+        tv_url = "https://scanner.tradingview.com/turkey/scan"
+        body = {"columns": ["name", "close", "change", "volume"], "range": [0, 1000]}
+        r = requests.post(tv_url, json=body, timeout=10)
+        if r.status_code != 200:
+            return {"hata": "TradingView yanıt vermedi"}
+
+        data = r.json().get("data", [])
+        tum_hisseler = []
+        for item in data:
+            d = item.get("d", [])
+            if len(d) < 4:
+                continue
+            if d[1] is None or d[2] is None or d[3] is None:
+                continue
+            try:
+                tum_hisseler.append({
+                    "sembol": str(d[0]),
+                    "fiyat": float(d[1]),
+                    "degisimYuzdesi": float(d[2]),
+                    "hacim": int(d[3]),
+                })
+            except (TypeError, ValueError):
+                continue
+
+        tum_hisseler = [h for h in tum_hisseler if h["fiyat"] > 0 and h["hacim"] > 0]
+
+        return {
+            "taranan": len(tum_hisseler),
+            "yukselenler": sorted(tum_hisseler, key=lambda x: x["degisimYuzdesi"], reverse=True)[:10],
+            "dusenler": sorted(tum_hisseler, key=lambda x: x["degisimYuzdesi"])[:10],
+            "hacimliler": sorted(tum_hisseler, key=lambda x: x["hacim"], reverse=True)[:10],
+        }
+    except Exception as e:
+        return {"hata": str(e)}
+
+
+@app.get("/mumlar/{sembol}")
+def mum_verisi_getir(sembol: str):
+    sembol_saf = sembol.replace(".IS", "").upper()
+    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sembol_saf}.IS?interval=1d&range=1mo"
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if r.status_code != 200:
+            raise HTTPException(status_code=404, detail=f"'{sembol_saf}' için veri bulunamadı.")
+
+        data = r.json()
+        result = data.get("chart", {}).get("result")
+        if not result:
+            raise HTTPException(status_code=404, detail=f"'{sembol_saf}' için veri bulunamadı.")
+        result = result[0]
+
+        timestamps = result.get("timestamp", [])
+        indicators = result.get("indicators", {}).get("quote", [])
+        if not timestamps or not indicators:
+            return []
+        quote = indicators[0]
+
+        closes = quote.get("close", [])
+        opens = quote.get("open", [])
+        highs = quote.get("high", [])
+        lows = quote.get("low", [])
+        volumes = quote.get("volume", [])
+
+        mumlar = []
+        son_gecerli_close = 0
+        for i in range(len(timestamps)):
+            c = closes[i] if i < len(closes) and closes[i] is not None else None
+            o = opens[i] if i < len(opens) and opens[i] is not None else None
+            h = highs[i] if i < len(highs) and highs[i] is not None else None
+            l = lows[i] if i < len(lows) and lows[i] is not None else None
+            v = volumes[i] if i < len(volumes) and volumes[i] is not None else 0.0
+
+            if c is not None:
+                son_gecerli_close = c
+            elif son_gecerli_close != 0:
+                c = o = h = l = son_gecerli_close
+            else:
+                continue
+
+            mumlar.append({
+                "timestamp": int(timestamps[i] * 1000),
+                "open": o if o is not None else c,
+                "high": h if h is not None else c,
+                "low": l if l is not None else c,
+                "close": c,
+                "volume": v,
+            })
+
+        return mumlar
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# ROTALAR: FİYAT, PORTFÖY VE İŞLEMLER (giriş gerekli)
 # ==========================================
 @app.get("/fiyat/{sembol}")
 def fiyat_getir(sembol: str, kullanici: Kullanici = Depends(gecerli_kullanici)):
@@ -288,6 +411,10 @@ def portfoy_getir(kullanici: Kullanici = Depends(gecerli_kullanici), db: Session
 
 @app.post("/al")
 def hisse_al(istek: IslemIstek, kullanici: Kullanici = Depends(gecerli_kullanici), db: Session = Depends(db_al)):
+    acik, mesaj = piyasa_acik_mi()
+    if not acik:
+        raise HTTPException(status_code=400, detail=mesaj)
+
     if istek.adet <= 0:
         raise HTTPException(status_code=400, detail="Adet 0'dan büyük olmalı.")
 
@@ -325,6 +452,10 @@ def hisse_al(istek: IslemIstek, kullanici: Kullanici = Depends(gecerli_kullanici
 
 @app.post("/sat")
 def hisse_sat(istek: IslemIstek, kullanici: Kullanici = Depends(gecerli_kullanici), db: Session = Depends(db_al)):
+    acik, mesaj = piyasa_acik_mi()
+    if not acik:
+        raise HTTPException(status_code=400, detail=mesaj)
+
     if istek.adet <= 0:
         raise HTTPException(status_code=400, detail="Adet 0'dan büyük olmalı.")
 
