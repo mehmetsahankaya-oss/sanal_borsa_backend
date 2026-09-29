@@ -21,7 +21,7 @@ BASLANGIC_BAKIYESI = 100000.0
 
 # ÖNEMLİ: Bunu Render'da ortam değişkeni (Environment Variable) olarak
 # JWT_SECRET adıyla kendiniz belirleyin (rastgele uzun bir metin).
-JWT_SECRET = os.environ.get("JWT_SECRET", "sanal-borsa-gizli-anahtar-BUNU-DEGISTIR")
+JWT_SECRET = os.environ.get("JWT_SECRET", "AQ.Ab8RN6IigESJSn4jC7ndq_VZzxwnmlPP4aaaW9VhR4vwPTpjhw")
 JWT_ALGORITMA = "HS256"
 JWT_GECERLILIK_GUN = 30
 
